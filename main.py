@@ -1,4 +1,4 @@
-from HPBundle import Hybrid_Bundle
+from HPBundle import Hybrid_Bundle, Worker
 import torch.multiprocessing as mp
 import argparse
 
@@ -27,41 +27,54 @@ parser.add_argument('--num-hp',type=int,default=1,
                     help='Degree of inter processing (number of node)')
 parser.add_argument('--weight-decay','--wd',default=1e-4,type=float,metavar='W',
                     help='weight decay (default: 1e-4)')
-parser.add_argument('--dp-only',default=False,type=bool,
+parser.add_argument('--DP-ONLY',dest='DP_ONLY',action='store_true',
                     help='boolean flag for data parallelism only ')
 parser.add_argument('data',metavar='DIR',
                     help='path to dataset')
 
 def main(args):
 
-    hybrids = []
+    workers = []
     process = []
     num_hp = args.num_hp
 
     mp.set_start_method('spawn')
 
-    for i in range(num_hp):
-        hybrids.append(Hybrid_Bundle(batch_size=32,
+    if args.DP_ONLY:
+        for i in range(num_hp):
+            workers.append(Worker(batch_size=args.batch_size,
+                                  num_total_worker=num_hp,
+                                  args=args))
+        # Get sync Q
+        COLLECTIVE_Q, \
+        DISTRIBUTE_Q = workers[0].get_sync_channel()
+
+        # Set sync Q
+        for i in range(1,num_hp):
+            workers[i].set_sync_channel(COLLECTIVE_Q[i-1],
+                                        DISTRIBUTE_Q[i-1])
+
+    else:
+        for i in range(num_hp):
+            workers.append(Hybrid_Bundle(batch_size=args.batch_size,
                                      num_hp=num_hp,
                                      args=args))
 
+        # Get sync Q
+        FRONT_COLLECTIVE_Q, \
+        FRONT_DISTRIBUTE_Q, \
+        REAR_COLLECTIVE_Q, \
+        REAR_DISTRIBUTE_Q = workers[0].get_sync_channel()
 
-    FRONT_COLLECTIVE_Q, \
-    FRONT_DISTRIBUTE_Q, \
-    REAR_COLLECTIVE_Q, \
-    REAR_DISTRIBUTE_Q = hybrids[0].get_sync_channel()
-
-    for i in range(num_hp):
-
-        # Setting for Intra-DP
-        if i is not 0:
-            hybrids[i].set_sync_channel(FRONT_COLLECTIVE_Q[i-1],
+        # Set sync Q
+        for i in range(1,num_hp):
+            workers[i].set_sync_channel(FRONT_COLLECTIVE_Q[i-1],
                                         FRONT_DISTRIBUTE_Q[i-1],
                                         REAR_COLLECTIVE_Q[i-1],
                                         REAR_DISTRIBUTE_Q[i-1])
+    for i in range(num_hp):
         # Run all Bundle Processes
-        p = mp.Process(target=hybrids[i].run,
-                       args=())
+        p = mp.Process(target=workers[i].run)
         p.start()
         process.append(p)
 

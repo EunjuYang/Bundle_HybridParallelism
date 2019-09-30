@@ -6,7 +6,7 @@ How to split the model should be defined under `model.py` with its model name.
 ----
 ### Bundle-based Hybrid Parallelism
 
-![Example of Hybrid Parallelism](figure/Bundle_HP_Figure.png)
+![Example of Hybrid Parallelism](Figure/Bundle_HP_Figure.png)
 
 By default, bundle works with two sub-models: front and rear model. 
 Each model runs on one GPU and they communicate each other via CPU.
@@ -20,7 +20,7 @@ For more detail, please refer to paper.
 ### How to execute
 
 This code supports ...  
- - Budnled-based hybrid parallelism 
+ - Bundle-based hybrid parallelism 
  - Data parallelism
  - Model parallelism
  
@@ -38,7 +38,7 @@ The code provides
 ```bash
 python main.py \ 
         --batch-size = 32 \
-        --rank = 0 \
+        --rank = {rank of this node} \
         --num-hp = {number of bundles running in this node} \
         --IP = {IP_address_for_MASTER} \
         --world-size = {number of inter-connected servers} \
@@ -58,11 +58,11 @@ Then, `--num-hp` flag will only get the value of the number of workers used for 
 ```bash
 python main.py \
         --batch-size = 32 \
-        --rank = 0 \
-        --num-hp = 4 \
+        --rank = {rank of this node} \
+        --num-hp = {number of workers for data parallelism} \
         --IP = {IP_address_for_MASTER} \
         --modela = resnet101 \
-        --world-size = 2 \
+        --world-size = {number of inter-DP servers} \
         --DP-ONLY \
         ~/Downloads/ImageNet/
 ```
