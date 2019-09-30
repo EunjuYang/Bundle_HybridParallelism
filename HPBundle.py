@@ -23,14 +23,21 @@ class Hybrid_Bundle():
     # Do not refer class variable in new process but use object variable with self.
     NUM_HP = 0
 
-    # Mode of Model Parallelism
-    # Default value two denotes there exist two part of model in this HP
-    MP_MODE = 2
 
     def __init__(self, batch_size, num_hp, args=None):
 
+        if args.DP_ONLY:
+            self.MP_MODE = 1
+        else:
+            # Mode of Model Parallelism
+            # Default value two denotes there exist two part of model in this HP
+            MP_MODE = 2
+            self.MP_MODE = 2
+
+        self.DP_ONLY = args.DP_ONLY
+
         # rank of hybrid parameter server
-        self.bundle_local_rank = Hybrid_Bundle.NUM_HP
+        self.bundle_local_rank = self.NUM_HP
 
         # batch size of this hybrid pair
         self.bs = batch_size
@@ -39,18 +46,18 @@ class Hybrid_Bundle():
         self.num_hp = num_hp
 
         # inter HP node list (rank list)
-        self.inter_sync_front   = [Hybrid_Bundle.MP_MODE * i for i in range(args.world_size)]
-        self.inter_sync_rear    = [Hybrid_Bundle.MP_MODE * i + 1 for i in range(args.world_size)]
+        self.inter_sync_front   = [self.MP_MODE * i for i in range(args.world_size)]
+        self.inter_sync_rear    = [self.MP_MODE * i + 1 for i in range(args.world_size)]
         self.INTER_DP = True if args.world_size > 1 else False
 
 
         # Test num_hp range check
-        if torch.cuda.device_count() < self.num_hp * Hybrid_Bundle.MP_MODE:
+        if torch.cuda.device_count() < self.num_hp * self.MP_MODE:
             num_gpus = torch.cuda.device_count()
             print(colored(' <ERROR!>', "red"),
                   colored('Number of GPUs (%d) are insufficient to support hybrid_bundle with degree %d \n'% (num_gpus, self.num_hp),'yellow'),
                   colored('<ERROR!>', "red"),
-                  colored('At least %d GPUs are required' % (num_hp * Hybrid_Bundle.MP_MODE), "yellow"))
+                  colored('At least %d GPUs are required' % (num_hp * self.MP_MODE), "yellow"))
             exit()
 
         # master bool var
@@ -77,8 +84,10 @@ class Hybrid_Bundle():
                 self.REAR_COLLECTIVE_Q.append(mp.Queue())
                 self.REAR_DISTRIBUTE_Q.append(mp.Queue())
 
-        self.MP_FORWARD_Q = mp.Queue()
-        self.MP_BACKWARD_Q = mp.Queue()
+        # If Hybrid Parallelism (MP)
+        if not self.DP_ONLY:
+            self.MP_FORWARD_Q = mp.Queue()
+            self.MP_BACKWARD_Q = mp.Queue()
 
 
 
@@ -88,7 +97,6 @@ class Hybrid_Bundle():
             return -1, -1, -1, -1
         else:
             return self.FRONT_COLLECTIVE_Q, self.FRONT_DISTRIBUTE_Q, self.REAR_COLLECTIVE_Q, self.REAR_DISTRIBUTE_Q
-
 
 
     def set_sync_channel(self, front_collective, front_distribute, rear_collective, rear_distribute):
@@ -105,25 +113,126 @@ class Hybrid_Bundle():
         processes  = []
         print("=====> (Bundle %d) start"%self.bundle_local_rank)
 
-        # Front Server
-        p = mp.Process(target=self.front)
-        p.start()
-        processes.append(p)
+        if self.DP_ONLY:
+            p = mp.Process(target=self.worker)
+            p.start()
+            processes.append(p)
 
-        # Rear Server
-        p = mp.Process(target=self.rear)
-        p.start()
-        processes.append(p)
+        else:
+            # Front Server
+            p = mp.Process(target=self.front)
+            p.start()
+            processes.append(p)
+
+            # Rear Server
+            p = mp.Process(target=self.rear)
+            p.start()
+            processes.append(p)
 
         # Join two servers
         for p in processes:
             p.join()
 
 
+    def worker(self):
+
+        # Set GPU rank (index)
+        gpu_rank    = self.bundle_local_rank
+        model_name  = self.args.model
+        Net         = getattr(model, model_name)
+
+        # Setting INTER DP
+        if self.MASTER:
+            dist.init_process_group(backend='gloo',
+                                    init_method='tcp://%s:%s' % (self.args.IP, self.args.portNum),
+                                    rank = (self.args.rank) * self.MP_MODE,
+                                    world_size = self.args.world_size * self.MP_MODE)
+            self.front_sync_group = dist.new_group(self.inter_sync_front)
+
+        print("=====> (DP ONLY Bundle %d); worker start with GPU %d "% (self.bundle_local_rank, gpu_rank))
+
+        # Data Preparation
+        train_dir   = os.path.join(self.args.data, 'train')
+        val_dir     = os.path.join(self.args.data, 'val')
+        normalize   = transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                                           std=[0.229,0.224,0.225])
+
+        train_dataset = datasets.ImageFolder(
+            train_dir,
+            transforms.Compose([
+                transforms.RandomResizedCrop(224),
+                transforms.RandomHorizontalFlip(),
+                transforms.ToTensor(),
+                normalize,
+            ])
+        )
+
+        train_loader = torch.utils.data.DataLoader(
+            train_dataset,
+            batch_size  = self.bs,
+            shuffle     = True,
+            num_workers = self.num_hp,
+            pin_memory  = True,
+        )
+
+
+        # For model parallelism; data shuffle matching
+        SEED = 777 + self.bundle_local_rank
+        torch.manual_seed(SEED)
+        torch.cuda.manual_seed(SEED)
+        np.random.seed(SEED)
+        random.seed(SEED)
+        torch.backends.cudnn.deterministic = True
+
+        # Setting for forward
+        torch.cuda.set_device(gpu_rank)
+
+        # Declare network model and allocate its memory on GPU
+        net = Net().cuda(gpu_rank)
+
+        # Define optimizer to be used in training
+        optimizer   = optim.SGD(net.parameters(),
+                                lr       = self.args.lr,
+                                momentum = self.args.momentum,
+                                weight_decay = self.args.weight_decay)
+        optimizer.zero_grad()
+        criterion = nn.CrossEntropyLoss().cuda(gpu_rank)
+
+        for batch_idx, (data, target) in enumerate(train_loader):
+
+            print("-----(BUNDLE %d) worker itr %d-----" % (self.bundle_local_rank, batch_idx))
+
+            # load on gpu
+            data = data.cuda(gpu_rank)
+            target = target.cuda(gpu_rank)
+
+            # feed forward
+            output = net(data)
+            loss = criterion(output, target)
+            loss.backward()
+            torch.cuda.synchronize(gpu_rank)
+
+            # syncrhonize with intra-nodes
+            if batch_idx == 0 and self.MASTER:
+                self.front_ps = []
+                for name, layer in net.named_parameters():
+                    self.front_ps.append(layer.grad.data.cpu().detach())
+
+            self.front_synchronization(net)
+
+            # apply the update
+            optimizer.step()
+
+            del data, target
+
+            if batch_idx == self.args.itr:
+                return
+
+
     def front(self):
 
         # Set GPU rank (index)
-        gpu_rank    = self.bundle_local_rank * 2
+        gpu_rank    = self.bundle_local_rank * self.MP_MODE
 
         # Set network model for front
         model_name  = self.args.model + "_front"
@@ -133,8 +242,8 @@ class Hybrid_Bundle():
         if self.MASTER and self.INTER_DP:
             dist.init_process_group(backend='gloo',
                                     init_method='tcp://%s:%s' % (self.args.IP, self.args.portNum),
-                                    rank = (self.args.rank) * Hybrid_Bundle.MP_MODE,
-                                    world_size = self.args.world_size * Hybrid_Bundle.MP_MODE)
+                                    rank = (self.args.rank) * self.MP_MODE,
+                                    world_size = self.args.world_size * self.MP_MODE)
             self.front_sync_group = dist.new_group(self.inter_sync_front)
             self.rear_sync_group  = dist.new_group(self.inter_sync_rear)
 
@@ -237,8 +346,8 @@ class Hybrid_Bundle():
         if self.MASTER and self.INTER_DP:
             dist.init_process_group(backend='gloo',
                                     init_method='tcp://%s:%s' % (self.args.IP, self.args.portNum),
-                                    rank = (self.args.rank) * Hybrid_Bundle.MP_MODE + 1,
-                                    world_size = self.args.world_size * Hybrid_Bundle.MP_MODE)
+                                    rank = (self.args.rank) * self.MP_MODE + 1,
+                                    world_size = self.args.world_size * self.MP_MODE)
             self.front_sync_group = dist.new_group(self.inter_sync_front)
             self.rear_sync_group  = dist.new_group(self.inter_sync_rear)
 
