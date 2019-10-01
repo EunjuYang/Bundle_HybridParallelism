@@ -489,8 +489,10 @@ class Rear_Worker(Worker):
 
             # GET forward input (MP)
             forward_input_tmp = self.MP_FORWARD_Q.get()
+            self.distribute.tic()
             forward_input_tensor = forward_input_tmp.clone().cuda(self.gpu_rank)
             forward_input = Variable(forward_input_tensor, requires_grad=True).cuda(self.gpu_rank)
+            self.distribute.toc()
             target = target.cuda(self.gpu_rank)
             del forward_input_tmp
 
@@ -507,7 +509,9 @@ class Rear_Worker(Worker):
             self.comp_backprop.toc()
 
             # SEND backward output (MP)
+            self.collective.tic()
             self.MP_BACKWARD_Q.put(forward_input.grad.data)
+            self.collective.toc()
 
             # synchronization
             self._initialize_ps()

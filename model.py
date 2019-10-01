@@ -1,7 +1,11 @@
 """
-This model file contains class for Net
-I will replace this as resnet model later
-this is for test refactoring of my code !!
+This model file contains some example code for model parallelism.
+We will add some codes to support automatic decision making for model parallelism.
+(TODO) update this file
+    --> add some function for decision making & automatic partitioning
+
+    - last update: 2019.09.30
+    - E.Jubilee Yang
 """
 import torch.nn as nn
 import torch.nn.functional as F
@@ -643,7 +647,7 @@ def resnet101_trial4_rear(pretrained=False, **kwargs):
     :param kwargs:
     :return:
     """
-    model = ResNet_hybrid(Bottleneck, [0,0,15,3],False,1024, **kwargs)
+    model = ResNet_hybrid(Bottleneck, [0,0,15,3],True,1024, **kwargs)
     return model
 
 def resnet101_trial3_front(pretrained=False, **kwargs):
