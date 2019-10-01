@@ -1,13 +1,16 @@
 """
-This code contains code for hybrid parallelism (HP) parameter server.
-One Hybrid_PS contains two PSs - parameter server for front and rear.
+This code contains code for hybrid parallelism (HP) bundle.
+One HP_Bundle contains two worker: Front_Worker and Rear_Worker
+For Data Parallelism only, worker can be used.
+For more detail of its usage, please refer to main.py
 
-
+    - last update: 2019.09.30
+    - E.Jubilee Yang
 """
 from termcolor import colored
 from torchvision import datasets, transforms
 from torch.autograd import Variable
-from util import AverageMeter
+from util import AverageMeter, ProgressMeter
 import torch.optim as optim
 import torch.distributed as dist
 import torch.nn as nn
@@ -44,14 +47,19 @@ class Worker():
                 self.DISTRIBUTE_Q.append(mp.Queue())
 
         # Setting Average Meter
-        self.collective = AverageMeter('collective', ':6.3f')
-        self.distribute = AverageMeter('distribute', ':6.3f')
-        self.intra_mp_send = AverageMeter('intra_mp', ':6.3f')
         self.sync_upload = AverageMeter('sync_upload', ':6.3f')
         self.sync_download = AverageMeter('sync_download', ':6.3f')
         self.inter_sync_comm = AverageMeter('inter_sync_comm', ':6.3f')
         self.comp_forward = AverageMeter('comp_forward', ':6.3f')
         self.comp_backprop = AverageMeter('comp_backprop', ':6.3f')
+        self.progress = ProgressMeter(self.args.itr,
+                                      'worker_rank %d'%self.local_rank,
+                                      'white',
+                                      self.sync_upload,
+                                      self.sync_download,
+                                      self.inter_sync_comm,
+                                      self.comp_forward,
+                                      self.comp_backprop)
 
     def get_sync_channel(self):
         """
@@ -100,7 +108,7 @@ class Worker():
                                     world_size = self.args.world_size)
             self.sync_group = dist.new_group(self.inter_sync)
 
-        print("=====> (DP ONLY Bundle %d); worker start with GPU %d "% (self.local_rank, self.gpu_rank))
+        print(colored("=====> (DP ONLY Bundle %d); worker start with GPU %d "% (self.local_rank, self.gpu_rank), "green"))
 
         # Prepare Training Data Set & Set SEED Value
         self._prepare_training()
@@ -119,7 +127,6 @@ class Worker():
 
         for batch_idx, (data, target) in enumerate(self.train_loader):
 
-            print("-----(BUNDLE %d) worker itr %d-----" % (self.local_rank, batch_idx))
 
             # load on gpu
             data = data.cuda(self.gpu_rank)
@@ -151,6 +158,8 @@ class Worker():
             optimizer.step()
 
             del data, target
+            self.progress.print_progress(batch_idx)
+
             if batch_idx == self.args.itr:
                 return
 
@@ -221,8 +230,10 @@ class Worker():
 
             # INTER_SYNC
             if self.INTER_DP:
+                self.inter_sync_comm.tic()
                 for grad in self.ps:
                     dist.all_reduce(grad, op=dist.ReduceOp.SUM, group=self.sync_group)
+                self.inter_sync_comm.toc()
 
 
             # DISTRIBUTE
@@ -336,6 +347,19 @@ class Front_Worker(Worker):
             self.inter_sync_front   = [self.MP_DEGREE * i for i in range(args.world_size)]
             self.inter_sync_rear    = [self.MP_DEGREE * i + 1 for i in range(args.world_size)]
 
+        self.collective = AverageMeter('collective', ':6.3f')
+        self.distribute = AverageMeter('distribute', ':6.3f')
+        self.progress = ProgressMeter(self.args.itr,
+                                      'FRONT %d'%self.local_rank,
+                                      'yellow',
+                                      self.collective,
+                                      self.distribute,
+                                      self.sync_upload,
+                                      self.sync_download,
+                                      self.inter_sync_comm,
+                                      self.comp_forward,
+                                      self.comp_backprop)
+
     def run(self):
         self.gpu_rank   = self.local_rank * self.MP_DEGREE
         model_name      = self.args.model + "_front"
@@ -361,22 +385,33 @@ class Front_Worker(Worker):
 
         for batch_idx, (data, target) in enumerate(self.train_loader):
 
-            print("-----(BUNDLE %d) front itr %d-----" % (self.local_rank, batch_idx))
             # load on gpu
             data = data.cuda(self.gpu_rank)
 
             # feed forward
+            self.comp_forward.tic()
             output = self.net(data)
+            self.comp_forward.toc()
 
             # send feed forward output to rear
-            self.MP_FORWARD_Q.put(output.cpu().detach())
+            self.collective.tic()
+            tensor_send_forward = output.cpu().detach()
+            torch.cuda.synchronize(self.gpu_rank)
+            self.collective.toc()
+            self.MP_FORWARD_Q.put(tensor_send_forward)
 
             # receive backpropagation input from rear
             backward_input_tmp = self.MP_BACKWARD_Q.get()
-            backward_input = backward_input_tmp.cuda(self.gpu_rank)
+            self.distribute.tic()
+            backward_input = backward_input_tmp.clone().detach().cuda(self.gpu_rank)
+            torch.cuda.synchronize(self.gpu_rank)
+            self.distribute.toc()
+            del backward_input_tmp
 
             # backpropagation
+            self.comp_backprop.tic()
             output.backward(backward_input)
+            self.comp_backprop.toc()
 
             # synchronization
             self._initialize_ps()
@@ -386,7 +421,7 @@ class Front_Worker(Worker):
             optimizer.step()
 
             # Memory garbage collection
-            del backward_input_tmp
+            self.progress.print_progress(batch_idx)
 
             if batch_idx == self.args.itr:
                 return
@@ -406,6 +441,19 @@ class Rear_Worker(Worker):
             self.inter_sync_front   = [self.MP_DEGREE * i for i in range(args.world_size)]
             self.inter_sync_rear    = [self.MP_DEGREE * i + 1 for i in range(args.world_size)]
 
+        self.collective = AverageMeter('collective', ':6.3f')
+        self.distribute = AverageMeter('distribute', ':6.3f')
+        self.progress = ProgressMeter(self.args.itr,
+                                      'REAR  %d'%self.local_rank,
+                                      'green',
+                                      self.collective,
+                                      self.distribute,
+                                      self.sync_upload,
+                                      self.sync_download,
+                                      self.inter_sync_comm,
+                                      self.comp_forward,
+                                      self.comp_backprop)
+
     def run(self):
 
         self.gpu_rank   = self.local_rank * self.MP_DEGREE + 1
@@ -422,6 +470,7 @@ class Rear_Worker(Worker):
             self.sync_group = self.rear_sync_group
 
         print("=====> (Bundle %d); rear start with GPU %d "% (self.local_rank, self.gpu_rank))
+
         self._prepare_training()
 
         # Declare network model and allocate its memory on GPU
@@ -437,22 +486,25 @@ class Rear_Worker(Worker):
 
         for batch_idx, (data, target) in enumerate(self.train_loader):
 
-            print("-----(BUNDLE %d) rear itr %d-----" % (self.local_rank, batch_idx))
 
             # GET forward input (MP)
             forward_input_tmp = self.MP_FORWARD_Q.get()
             forward_input_tensor = forward_input_tmp.clone().cuda(self.gpu_rank)
             forward_input = Variable(forward_input_tensor, requires_grad=True).cuda(self.gpu_rank)
+            target = target.cuda(self.gpu_rank)
             del forward_input_tmp
 
             # FEED FORWARD
+            self.comp_forward.tic()
             forward_output = self.net(forward_input)
-            target = target.cuda(self.gpu_rank)
             torch.cuda.synchronize(self.gpu_rank)
+            self.comp_forward.toc()
 
             loss = criterion(forward_output, target)
+            self.comp_backprop.tic()
             loss.backward()
             torch.cuda.synchronize(self.gpu_rank)
+            self.comp_backprop.toc()
 
             # SEND backward output (MP)
             self.MP_BACKWARD_Q.put(forward_input.grad.data)
@@ -466,6 +518,7 @@ class Rear_Worker(Worker):
 
             # memory garbage collection
             del forward_input, forward_output, target
+            self.progress.print_progress(batch_idx)
 
             if batch_idx == self.args.itr:
                 return
@@ -541,7 +594,7 @@ class Hybrid_Bundle():
 
         self._check_set_sync_channel()
         processes = []
-        print("=====> (Bundle %d) start"% self.local_rank)
+        print(colored("=====> (Bundle %d) start"% self.local_rank, "green"))
 
         processes.append(mp.Process(target=self.front_worker.run))
         processes.append(mp.Process(target=self.rear_worker.run))
@@ -565,6 +618,11 @@ class Hybrid_Bundle():
         self.MP_BACKWARD_Q = mp.Queue()
 
     def _create_sync_queue(self):
+        """
+        (Deprecated) This function won't be called.
+        MASTER of Front_Worker & Rear_Worker will create their sync_queue in their constructor
+        :return:
+        """
 
         # Synchronous Q (Only Master Create)
         if self.MASTER:

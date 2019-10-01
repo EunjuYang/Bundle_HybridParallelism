@@ -1,5 +1,6 @@
 #!/usr/bin/env python
 import time
+from termcolor import colored
 
 class AverageMeter(object):
 
@@ -33,15 +34,16 @@ class AverageMeter(object):
 
 class ProgressMeter(object):
 
-    def __init__(self, itr, prefix="", *meters):
+    def __init__(self, itr, prefix="", color='yellow', *meters):
 
-        self.progress_fmtstr = self._get_batch_fmtstr(itr) + ']'
+        self.progress_fmtstr = self._get_progress_fmtstr(itr)
         self.meters = meters
         self.prefix = prefix
+        self.color  = color
 
     def print_progress(self, itr):
 
-        entries = [self.prefix + self.progress_fmtstr.format(itr)]
+        entries = [colored('[{:7s}]'.format(self.prefix),self.color) + self.progress_fmtstr.format(itr)]
         entries += [str(meter) for meter in self.meters]
         print('\t'.join(entries))
 

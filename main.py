@@ -1,3 +1,12 @@
+"""
+Bundle-based Hybrid Parallelism test code.
+This code is used to test and describe its action.
+We didn't do code optimization especially in multiprocessing part.
+Some communication hiding techniques are required to optimize its performance.
+
+    - last update: 2019.09.30
+    - E.Jubilee Yang
+"""
 from HPBundle import Hybrid_Bundle, Worker
 import torch.multiprocessing as mp
 import argparse
