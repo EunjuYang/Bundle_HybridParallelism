@@ -284,9 +284,10 @@ class HP_BUNDLE():
     def _hp_front_ps(self):
 
         # declare dist process
+        rank = self.args.rank * 2
         dist.init_process_group(backend='gloo',
                                 init_method='tcp://%s:%s' % (self.args.IP, self.args.portNum),
-                                rank=self.args.node_rank * 2,
+                                rank=rank,
                                 world_size=self.world_size)
 
         self.sync_front_group = dist.new_group([ 2 * i for i in range(self.world_num_nodes)])
@@ -328,13 +329,19 @@ class HP_BUNDLE():
     def _hp_rear_ps(self):
 
         # declare dist process
+        print("_hp_front_ps")
+        rank = self.args.rank * 2 + 1
         dist.init_process_group(backend='gloo',
                                 init_method='tcp://%s:%s' % (self.args.IP, self.args.portNum),
-                                rank=self.args.node_rank * 2 + 1,
+                                rank=rank,
                                 world_size=self.world_size)
 
+        print("dist init")
         self.sync_front_group = dist.new_group([ 2 * i for i in range(self.world_num_nodes)])
         self.sync_rear_group = dist.new_group([ 2 * i + 1 for i in range(self.world_num_nodes)])
+        print(self.sync_front_group)
+        print(self.sync_rear_group)
+        print(self.world_size)
 
         # set front_ps & rear_ps
         self.rear_ps = []
