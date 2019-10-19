@@ -43,7 +43,7 @@ class ProgressMeter(object):
 
     def print_progress(self, itr):
 
-        entries = [colored('[{:7s}]'.format(self.prefix),self.color) + self.progress_fmtstr.format(itr)]
+        entries = [colored('[{:9}]'.format(self.prefix),self.color) + self.progress_fmtstr.format(itr)]
         entries += [str(meter) for meter in self.meters]
         print('\t'.join(entries))
 

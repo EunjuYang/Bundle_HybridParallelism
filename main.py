@@ -34,7 +34,9 @@ parser.add_argument('--model',default='resnet101_trial1',
                     type=str)
 parser.add_argument('--world-size',type=int,default=0,
                     help='Degree of inter processing (number of node)')
-parser.add_argument('--num-hp',type=int,default=1,
+parser.add_argument('--bundle-shape',type=str,default="1,1",
+                    help='Shape of bundle')
+parser.add_argument('--num-bundle',type=int,default=1,
                     help='Degree of inter processing (number of hp)')
 parser.add_argument('--weight-decay','--wd',default=1e-4,type=float,metavar='W',
                     help='weight decay (default: 1e-4)')
@@ -47,16 +49,20 @@ def main(args):
 
     workers = []
     process = []
-    num_hp = args.num_hp
 
     mp.set_start_method('spawn')
+    shape = [int(degree) for degree in args.bundle_shape.split(",")]
 
-    hybrid_bundle = HP_BUNDLE(shape=[1,1],
-                              num_bundles=args.num_hp,
-                              num_nodes=args.world_size,
-                              rank=0,
-                              args=args)
-    hybrid_bundle.run()
+    if not args.DP_ONLY:
+        hybrid_bundle = HP_BUNDLE(shape=shape,
+                                  num_bundles=args.num_bundle,
+                                  num_nodes=args.world_size,
+                                  rank=args.rank,
+                                  args=args)
+        hybrid_bundle.run()
+
+    else:
+        print("DP_ONLY is not yet supported.")
 
 if __name__ == '__main__':
 
