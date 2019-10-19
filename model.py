@@ -650,6 +650,26 @@ def resnet101_trial4_rear(pretrained=False, **kwargs):
     model = ResNet_hybrid(Bottleneck, [0,0,15,3],True,1024, **kwargs)
     return model
 
+def resnet101_trial5_front(pretrained=False, **kwargs):
+    """
+    resnet_trial4_front only (conv1~conv4_24)
+    :param pretrained:
+    :param kwargs:
+    :return:
+    """
+    model = ResNet_hybrid(Bottleneck, [3,4,16,0],False,64, **kwargs)
+    return model
+
+def resnet101_trial5_rear(pretrained=False, **kwargs):
+    """
+    resnet101_tiral4_rear only (conv4_25~fc)
+    :param pretrained:
+    :param kwargs:
+    :return:
+    """
+    model = ResNet_hybrid(Bottleneck, [0,0,7,3],True,1024, **kwargs)
+    return model
+
 def resnet101_trial3_front(pretrained=False, **kwargs):
     """
     resnet_trial3_front only (conv1~conv4_9)

@@ -7,7 +7,7 @@ Some communication hiding techniques are required to optimize its performance.
     - last update: 2019.09.30
     - E.Jubilee Yang
 """
-from HPBundle import Hybrid_Bundle, Worker
+from HPBundle   import HP_BUNDLE
 import torch.multiprocessing as mp
 import argparse
 
@@ -24,6 +24,8 @@ parser.add_argument('--momentum',default=0.9,type=float,metavar='M',
                     help='momentum')
 parser.add_argument('--itr',type=int,default=50,
                     help='test iteration')
+parser.add_argument('--node-rank',type=int,default=0,
+                    help='rank of this node')
 parser.add_argument('--IP',default='127.0.0.1',type=str,
                     help='URL used to set up distributed training')
 parser.add_argument('--portNum',default='8888',type=str,
@@ -32,8 +34,10 @@ parser.add_argument('--model',default='resnet101_trial1',
                     type=str)
 parser.add_argument('--world-size',type=int,default=0,
                     help='Degree of inter processing (number of node)')
-parser.add_argument('--num-hp',type=int,default=1,
-                    help='Degree of inter processing (number of node)')
+parser.add_argument('--bundle-shape',type=str,default="1,1",
+                    help='Shape of bundle')
+parser.add_argument('--num-bundle',type=int,default=1,
+                    help='Degree of inter processing (number of hp)')
 parser.add_argument('--weight-decay','--wd',default=1e-4,type=float,metavar='W',
                     help='weight decay (default: 1e-4)')
 parser.add_argument('--DP-ONLY',dest='DP_ONLY',action='store_true',
@@ -45,51 +49,20 @@ def main(args):
 
     workers = []
     process = []
-    num_hp = args.num_hp
 
     mp.set_start_method('spawn')
+    shape = [int(degree) for degree in args.bundle_shape.split(",")]
 
-    if args.DP_ONLY:
-        for i in range(num_hp):
-            workers.append(Worker(batch_size=args.batch_size,
-                                  num_total_worker=num_hp,
-                                  args=args))
-        # Get sync Q
-        COLLECTIVE_Q, \
-        DISTRIBUTE_Q = workers[0].get_sync_channel()
-
-        # Set sync Q
-        for i in range(1,num_hp):
-            workers[i].set_sync_channel(COLLECTIVE_Q[i-1],
-                                        DISTRIBUTE_Q[i-1])
+    if not args.DP_ONLY:
+        hybrid_bundle = HP_BUNDLE(shape=shape,
+                                  num_bundles=args.num_bundle,
+                                  num_nodes=args.world_size,
+                                  rank=args.rank,
+                                  args=args)
+        hybrid_bundle.run()
 
     else:
-        for i in range(num_hp):
-            workers.append(Hybrid_Bundle(batch_size=args.batch_size,
-                                     num_hp=num_hp,
-                                     args=args))
-
-        # Get sync Q
-        FRONT_COLLECTIVE_Q, \
-        FRONT_DISTRIBUTE_Q, \
-        REAR_COLLECTIVE_Q, \
-        REAR_DISTRIBUTE_Q = workers[0].get_sync_channel()
-
-        # Set sync Q
-        for i in range(1,num_hp):
-            workers[i].set_sync_channel(FRONT_COLLECTIVE_Q[i-1],
-                                        FRONT_DISTRIBUTE_Q[i-1],
-                                        REAR_COLLECTIVE_Q[i-1],
-                                        REAR_DISTRIBUTE_Q[i-1])
-    for i in range(num_hp):
-        # Run all Bundle Processes
-        p = mp.Process(target=workers[i].run)
-        p.start()
-        process.append(p)
-
-    for p in process:
-        p.join()
-
+        print("DP_ONLY is not yet supported.")
 
 if __name__ == '__main__':
 
