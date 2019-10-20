@@ -7,7 +7,7 @@ Some communication hiding techniques are required to optimize its performance.
     - last update: 2019.09.30
     - E.Jubilee Yang
 """
-from HPBundle   import HP_BUNDLE
+from HPBundle import HP_BUNDLE, DPBundle
 import torch.multiprocessing as mp
 import argparse
 
@@ -62,7 +62,9 @@ def main(args):
         hybrid_bundle.run()
 
     else:
-        print("DP_ONLY is not yet supported.")
+        dp_bundle = DPBundle(rank=args.rank,
+                             args=args)
+        dp_bundle.run()
 
 if __name__ == '__main__':
 

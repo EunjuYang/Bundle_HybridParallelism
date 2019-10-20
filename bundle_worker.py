@@ -63,24 +63,28 @@ class Worker():
             target = target.cuda(self.gpu_rank)
 
             # feed forward
+            self.comp_forward.tic()
             output = self.net(data)
             torch.cuda.synchronize(self.gpu_rank)
+            self.comp_forward.toc()
 
             # calculate loss
             loss = criterion(output, target)
 
             # backpropagation
             optimizer.zero_grad()
+            self.comp_backprop.tic()
             loss.backward()
             torch.cuda.synchronize(self.gpu_rank)
+            self.comp_backprop.toc()
 
             # synchronize all gradients
             self._synchronization()
 
             # apply the update
             optimizer.step()
-
             del data, target
+            self.progress.print_progress(batch_idx+1)
 
             if batch_idx == (self.args.itr - 1):
                 time.sleep(3)
