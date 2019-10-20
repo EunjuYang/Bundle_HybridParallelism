@@ -9,7 +9,7 @@ For more detail of its usage, please refer to main.py
 """
 import torch, threading, model, math
 from termcolor import colored
-from bundle_worker import Front, Rear
+from bundle_worker import Front, Rear, Worker
 from util import AverageMeter, ProgressMeter
 import torch.multiprocessing as mp
 import torch.distributed as dist
@@ -457,7 +457,7 @@ class HP_BUNDLE():
                          async_op=False)
             comm_backward.toc()
 
-            # send the backprop tensor to Bundle
+            # send the backprop tensor to undle
             self.front_hp_downQ[0].put(backprop_tmp)
 
             # collect data for sync
@@ -762,7 +762,6 @@ class HP_BUNDLE():
         time.sleep(5)
         return
 
-
 class Bundle():
     """
     Bundle objects are crated
@@ -843,7 +842,6 @@ class Bundle():
 
         for p in processes:
             p.join()
-
 
 class BundlePS():
     """
@@ -1298,3 +1296,81 @@ class BundlePS():
     def set_rear_hpQ(self, uploadQ, downloadQ):
         self.rear_upload_hpQ = uploadQ
         self.rear_download_hpQ = downloadQ
+
+class DPBundle():
+
+    def __init__(self, rank, args):
+        self.workers = []
+        self.rank = rank
+        self.args = args
+        self.num_worker = args.num_bundle // args.world_size
+        self.batch_size = args.batch_size // args.num_bundle
+        self.ps_upQ = []
+        self.ps_downQ = []
+
+        if self.num_worker > torch.cuda.device_count():
+            _print_error("Please check the setting; more gpus are required to run this configuration", True)
+
+        for i in range(self.num_worker):
+            self.workers.append(Worker(rank=i,
+                                       batch_size=self.batch_size,
+                                       args=args))
+            upQ, downQ = self.workers[i].get_syncQ()
+            self.ps_upQ.append(upQ)
+            self.ps_downQ.append(downQ)
+
+        self.ps = []
+        dp_model = getattr(model, self.args.model)
+        dp_model = dp_model()
+        for layer in dp_model.parameters():
+            self.ps.append(layer.grad)
+
+    def run(self):
+
+        processes = []
+
+        # Run parameter server
+        p = mp.Process(target=self._ps)
+        p.start()
+        processes.append(p)
+
+        # Run workers
+        for w in self.workers:
+            p = mp.Process(target=w.run)
+            p.start()
+            processes.append(p)
+
+        for p in processes:
+            p.join()
+
+    def _ps(self):
+
+        dist.init_process_group(backend='gloo',
+                                init_method='tcp://%s:%s' % (self.args.IP, self.args.portNum),
+                                rank=self.rank,
+                                world_size=self.args.world_size)
+
+        for itr in range(self.args.itr):
+
+            # collect gradients
+            if itr == 0:
+                _sync_init(num_worker=self.num_worker,
+                           ps=self.ps,
+                           upload_q=self.ps_upQ)
+            else:
+                _sync_collect_ps(num_worker=self.num_worker,
+                                 ps=self.ps,
+                                 upload_q=self.ps_upQ)
+
+            # all reduce
+            for grad in self.ps:
+                dist.all_reduce(grad, op=dist.ReduceOp.SUM)
+
+            # distribute gradients
+            _sync_distribute_ps(num_worker=self.num_worker,
+                                ps=self.ps,
+                                download_q=self.ps_downQ)
+
+        # WAIT
+        time.sleep(1)
+        return
