@@ -55,7 +55,6 @@ Here,
 
 #### Pure data Parallelism
 
-###### TBD  
 The code provides `--DP-ONLY` option. 
 If you type the flag, then it means you will run the code only using data parallelism.
 Then, `--num-hp` flag will only get the value of the number of workers used for data parallelism.
@@ -74,5 +73,25 @@ python main.py \
 
 ----
 
+#### Using Docker
 
+##### Pre-Requisites
 
+- Docker
+- Nvidia-Docker or [Accelerator-Docker](https://github.com/KAIST-NCL/Accelerator-Docker.git) to support running containers with GPUs
+
+##### Compile container image
+```bash
+docker build -t yejyang/budlehp:v01 ./
+```
+##### Run the bundle container with the script file
+
+Passing parameters as arguments
+```bash
+./run-bundle-hp.sh [batch_size] [rank] [shape] [num_bundle] [IP] [portNum] [world_size] [model] [data_path] [itr]
+``` 
+
+Or just running shell script to get some helps.
+```bash
+./run-bundle-hp.sh 
+``` 
