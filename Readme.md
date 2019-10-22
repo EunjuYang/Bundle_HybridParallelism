@@ -28,8 +28,19 @@ This code supports ...
 By default, the code supports to execute split model with hybrid parallelism.
 Following its definition, model parallelism with two workers is easily implemented using the code.
  
+#### Running with Code
 
-#### Hybrid Parallelism with Bundle
+##### Prepare running environment
+- python 3
+- pytorch
+- CUDA
+- termcolor `pip install termcolor`
+
+```bash
+git clone https://github.com/EunjuYang/Bundle_HybridParallelism.git
+```
+##### Running  the program
+###### Hybrid Parallelism with Bundle
 
 The code provides 
 
@@ -52,8 +63,7 @@ Here,
 `--world-size` denotes the number of servers which are interconnected each other.
 `--bundle-shape` denotes the shape of bundle (We only support partitioned in two parts, i.e. front & rear)
 
-
-#### Pure data Parallelism
+###### Pure data Parallelism
 
 The code provides `--DP-ONLY` option. 
 If you type the flag, then it means you will run the code only using data parallelism.
@@ -73,25 +83,42 @@ python main.py \
 
 ----
 
-#### Using Docker
+#### Running with Docker 
 
 ##### Pre-Requisites
 
 - Docker
 - Nvidia-Docker or [Accelerator-Docker](https://github.com/KAIST-NCL/Accelerator-Docker.git) to support running containers with GPUs
 
+    ```bash
+    $ curl -s -L https://nvidia.github.io/nvidia-docker/gpgkey | sudo apt-key add -
+    $ distribution=$(. /etc/os-release;echo $ID$VERSION_ID)
+    $ curl -s -L https://nvidia.github.io/nvidia-docker/$distribution/nvidia-docker.list | sudo tee /etc/apt/sources.list.d/nvidia-docker.list
+    $ sudo apt-get update
+    $ sudo apt-get install -y nvidia-docker2
+    ```
+ - Compose container cluster with swarm to support creating overlay network.
+    ```bash
+    (master)$ docker swarm init
+    (worker)$ docker swarm join --token <your_token> <your_ip_address>:2377
+    ```
+
 ##### Compile container image
 ```bash
-docker build -t yejyang/budlehp:v01 ./
+docker build -t yejyang/bundlehp:v01 ./
 ```
+
 ##### Run the bundle container with the script file
 
-Passing parameters as arguments
+Passing parameters as arguments (script runs with NVIDIA-Docker)
 ```bash
-./run-bundle-hp.sh [batch_size] [rank] [shape] [num_bundle] [IP] [portNum] [world_size] [model] [data_path] [itr]
+$ chmod 777 run-bundle-hp.sh
+$ ./run-bundle-hp.sh [batch_size] [rank] [shape] [num_bundle] [IP] [portNum] [world_size] [model] [data_path-absolute path] [itr]
 ``` 
+for example, `./run-bundle-hp.sh 32 1 4,2 1 2 resnet101_trial4 /home/yejyang/Downloads/ImageNet 2` means 
+"run `one` bundle shape of `[4,2]` over `two` worker with `resnet101_trial4` model, where this node has rank 1.
 
 Or just running shell script to get some helps.
 ```bash
-./run-bundle-hp.sh 
+$ ./run-bundle-hp.sh 
 ``` 
