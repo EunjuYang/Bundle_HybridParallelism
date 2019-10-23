@@ -192,13 +192,14 @@ class HP_BUNDLE():
             self.front_hp_upQ = []
             self.rear_hp_downQ = []
             self.rear_hp_upQ = []
+            self.num_bundle_worker = self.shape[0]+self.shape[1]
 
             for rank in range(self.local_num_hp):
                 self.bundles.append(Bundle(shape=self.shape,
                                            rank=rank,
                                            batch_size=self.batch_size,
                                            args=args,
-                                           offset=rank * self.bundle_degree))
+                                           offset=rank * self.num_bundle_worker))
                 self.front_hp_downQ.append(mp.Queue())
                 self.front_hp_upQ.append(mp.Queue())
                 self.bundles[rank].set_front_hpQ(uploadQ=self.front_hp_upQ[rank],
@@ -576,11 +577,11 @@ class HP_BUNDLE():
 
 
                 rear_local_bs = self.rear_worker_bs * self.local_shape[1]
-                forward_scatter_list = list(torch.split(forward_tensor, rear_local_bs))
+                forward_mp_list = list(torch.split(forward_tensor, rear_local_bs))
 
             # distribute forward tensors to rear workers
             dist.scatter(tensor=rear_forward_input_tmp,
-                         scatter_list=forward_scatter_list,
+                         scatter_list=forward_mp_list,
                          src=self.rear_intra_bundle_group[0],
                          group=self.dist_rear_intra_bundle_group,
                          async_op=False)
@@ -784,7 +785,7 @@ class Bundle():
                 self.front_worker.append(Front(rank=offset + i,
                                                batch_size=front_bs,
                                                args=args))
-            offset += i
+            offset += shape[0]
 
         # rear worker
         if shape[1] is not 0:

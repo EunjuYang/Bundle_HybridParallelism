@@ -83,7 +83,8 @@ class Worker():
 
             # apply the update
             optimizer.step()
-            del data, target
+            del data, target, loss
+            torch.cuda.empty_cache()
             self.progress.print_progress(batch_idx+1)
 
             if batch_idx == (self.args.itr - 1):
@@ -103,6 +104,7 @@ class Worker():
         for layer in self.net.parameters():
             grad = layer.grad.cpu().detach()
             self.up_Q.put(grad)
+            del grad
 
     def _sync_download(self):
 
@@ -164,6 +166,7 @@ class Front(Worker):
     def __init__(self, rank, batch_size, args, seed=None):
 
         super(Front, self).__init__(rank, batch_size, args, seed)
+        print("front worker batch size:", self.batch_size)
         # setting additional average meter
         self.collective = AverageMeter('collective', ':6.3f')
         self.distribute = AverageMeter('distribute', ':6.3f')
@@ -222,8 +225,8 @@ class Front(Worker):
 
             # update
             optimizer.step()
-            del data, output
-
+            #del data, target, output
+            #torch.cuda.empty_cache()
             self.progress.print_progress(batch_idx+1)
 
             if batch_idx == (self.args.itr - 1):
@@ -243,6 +246,7 @@ class Rear(Worker):
     def __init__(self, rank, batch_size, args, seed=None):
 
         super(Rear, self).__init__(rank, batch_size, args, seed)
+        print("rear worker batch size:", self.batch_size)
         # setting additional average meter
         self.collective = AverageMeter('collective', ':6.3f')
         self.distribute = AverageMeter('distribute', ':6.3f')
@@ -312,7 +316,9 @@ class Rear(Worker):
             optimizer.step()
 
             # garbage collection
-            del forward_output, target
+            #del forward_output, target, data, self.forward_input, loss
+            #torch.cuda.empty_cache()
+
             self.progress.print_progress(batch_idx+1)
 
             if batch_idx == (self.args.itr - 1):
@@ -323,6 +329,7 @@ class Rear(Worker):
         tmp = self._download_from_ps()
         tmp = tmp.cuda(self.gpu_rank)
         self.forward_input = Variable(tmp, requires_grad=True).cuda(self.gpu_rank)
+        del tmp
 
     def _upload_backprop(self):
 
