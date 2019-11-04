@@ -150,7 +150,6 @@ class HP_BUNDLE():
         # bundles
         self.bundles = []
 
-
         # MICRO BUNDLE
         if self.IS_MICRO_BUNDLE:
 
@@ -172,7 +171,7 @@ class HP_BUNDLE():
                 self.bundles[rank].set_front_hpQ(self.front_hp_upQ[0], self.front_hp_downQ[0])
                 rank += 1
 
-            elif self.local_shape[1] is not 0:
+            if self.local_shape[1] is not 0:
 
                 self.rear_hp_upQ = []
                 self.rear_hp_downQ = []
@@ -180,6 +179,7 @@ class HP_BUNDLE():
                 batch_size = self.rear_worker_bs * self.local_shape[1]
                 self.bundles.append(Bundle(shape=[0, self.local_shape[1]],
                                            rank=rank,
+                                           offset=self.local_shape[0],
                                            batch_size=batch_size,
                                            args=args))
                 self.rear_hp_downQ.append(mp.Queue())
@@ -225,7 +225,7 @@ class HP_BUNDLE():
                 offset += 1
 
             # RUN HP_PS for rear
-            elif self.local_shape[1] is not 0:
+            if self.local_shape[1] is not 0:
                 p = mp.Process(target=self._hp_micro_rear_ps,
                                args=(offset,))
                 p.start()
@@ -280,7 +280,7 @@ class HP_BUNDLE():
 
             num_hp = [local_max_num_hp] * self.args.world_size
             if self.args.num_bundle % local_max_num_hp is not 0:
-                num_hp[self.args.num_bundle // local_max_num_hp] = self.args.num_hp % local_max_num_hp
+                num_hp[self.args.num_bundle // local_max_num_hp] = self.args.num_bundle % local_max_num_hp
             self.local_num_hp = num_hp[self.node_rank]
 
         if self.IS_MICRO_BUNDLE:
@@ -359,16 +359,22 @@ class HP_BUNDLE():
 
         # Average Meter
         dist_sync = AverageMeter('dist_sync', ':6.3f')
+        distribute_grad = AverageMeter('distribute_grad', ':6.3f')
         comm_forward = AverageMeter('comm_forward', ":6.3f")
         comm_backward = AverageMeter('comm_backward', ":6.3f")
+        comm_gather = AverageMeter('comm_gather', ":6.3f")
+        comm_scatter = AverageMeter('comm_scatter', ":6.3f")
         bundle_sync = AverageMeter('bundle_sync', ':6.3f')
         # Progress Meter
         progress = ProgressMeter(self.args.itr,
                                  'HP_FRONT',
                                  'white',
                                  dist_sync,
+                                 distribute_grad,
                                  comm_forward,
                                  comm_backward,
+                                 comm_gather,
+                                 comm_scatter,
                                  bundle_sync)
 
         # declare dist process
@@ -402,32 +408,45 @@ class HP_BUNDLE():
         front_output = front_model(input)
         output_shape = [-1, front_output.shape[1], front_output.shape[2], front_output.shape[3]]
         bs = self.front_worker_bs * self.local_shape[0]
-        backprop_shape = [bs] + output_shape[1:]
+        front_bs = self.front_worker_bs * self.topology[0][0]
+        backprop_shape = [front_bs] + output_shape[1:]
         backprop_tmp = torch.tensor(np.zeros(backprop_shape, np.float32))
 
         if self.local_node_rank == self.front_intra_bundle_group[0]:
             for rank in self.front_intra_bundle_group:
-                bs = self.front_worker_bs * self.topology[rank][0]
+                #[2019/11/04] Currently, pyTorch does not support different size tensor gather/scatter T.T
+                #bs = self.front_worker_bs * self.topology[rank][0]
                 forward_shape = [bs] + output_shape[1:]
                 forward_mp_list.append(torch.tensor(np.zeros(forward_shape, np.float32)))
+
 
         for itr in range(self.args.itr):
 
             # collect feedforward for mp
             feed_forward_tmp = self.front_hp_upQ[0].get()
 
-            comm_forward.tic()
+
             # intra collect (dist.gather)
-            dist.gather(tensor=feed_forward_tmp,
-                        gather_list=forward_mp_list,
-                        dst=self.front_intra_bundle_group[0],
-                        group=self.dist_front_intra_bundle_group,
-                        async_op=False)
+            if len(self.front_intra_bundle_group) > 1:
+                # padding more data for gather
+                if bs < front_bs:
+                    feed_forward_tmp = torch.cat([feed_forward_tmp, feed_forward_tmp[:(front_bs-bs)]],0)
+
+                # gather
+                comm_gather.tic()
+                dist.gather(tensor=feed_forward_tmp,
+                            gather_list=forward_mp_list,
+                            dst=self.front_intra_bundle_group[0],
+                            group=self.dist_front_intra_bundle_group,
+                            async_op=False)
+                comm_gather.toc()
 
             # send feed forward to rear server
+            comm_forward.tic()
             if self.local_node_rank == self.front_intra_bundle_group[0]:
                 # create merged feed forward tensor
                 merged_forward = torch.cat(forward_mp_list)
+                merged_forward = (merged_forward.split(self.args.batch_size))[0]
                 # send feed forward tensor
                 dist.send(tensor=merged_forward,
                           dst=self.mp_intra_bundle_group[1],
@@ -444,22 +463,35 @@ class HP_BUNDLE():
                           src=self.mp_intra_bundle_group[1],
                           group=self.dist_mp_intra_bundle_group)
 
-                # local micro bundle batch size
-                local_batch_size = self.front_worker_bs * self.local_shape[0]
                 # split the backpropagation tensor into tensors list
                 backprop_mp_list = list(torch.split(merged_backprop,
-                                                    local_batch_size))
-
-            # scatter the split backpropagation within intra-bundle
-            dist.scatter(tensor=backprop_tmp,
-                         scatter_list=backprop_mp_list,
-                         src=self.front_intra_bundle_group[0],
-                         group=self.dist_front_intra_bundle_group,
-                         async_op=False)
+                                                    front_bs))
             comm_backward.toc()
 
+            # scatter the split backpropagation within intra-bundle
+            if len(self.front_intra_bundle_group) > 1:
+                # check padding for scatter
+                for front_rank in range(len(backprop_mp_list)):
+                    worker_bs = backprop_mp_list[front_rank].shape[0]
+                    if worker_bs < front_bs:
+                        backprop_mp_list[front_rank] = torch.cat([backprop_mp_list[front_rank], backprop_mp_list[front_rank][:(front_bs-worker_bs)]])
+
+                comm_scatter.tic()
+                dist.scatter(tensor=backprop_tmp,
+                             scatter_list=backprop_mp_list,
+                             src=self.front_intra_bundle_group[0],
+                             group=self.dist_front_intra_bundle_group,
+                             async_op=False)
+                comm_scatter.toc()
+
+                if bs < front_bs:
+                    local_backprop_tmp = torch.split(backprop_tmp,
+                                                   bs)[0]
+                else:
+                    local_backprop_tmp = backprop_tmp
+
             # send the backprop tensor to undle
-            self.front_hp_downQ[0].put(backprop_tmp)
+            self.front_hp_downQ[0].put(local_backprop_tmp)
 
             # collect data for sync
             if itr == 0:
@@ -473,25 +505,32 @@ class HP_BUNDLE():
 
             dist_sync.tic()
             # intra all reduce
-            for grad in self.front_ps:
-                dist.all_reduce(grad, op=dist.ReduceOp.SUM, group=self.dist_front_intra_bundle_group)
+            if len(self.front_intra_bundle_group) > 1:
+                for grad in self.front_ps:
+                    dist.reduce(tensor=grad,
+                                op=dist.ReduceOp.SUM,
+                                dst=self.front_intra_bundle_group[0],
+                                group=self.dist_front_intra_bundle_group)
 
             # inter all reduce
-            if self.local_node_rank == self.front_intra_bundle_group[0]:
+            if (len(self.global_sync_front_dp) > 1 ) and (self.local_node_rank == self.front_intra_bundle_group[0]):
                 for grad in self.front_ps:
                     dist.all_reduce(grad, op=dist.ReduceOp.SUM, group=self.sync_front_group)
 
             # intra distribute sync
-            for idx, grad in enumerate(self.front_ps):
-                dist.broadcast(tensor=self.front_ps[idx],
-                               src=self.front_intra_bundle_group[0],
-                               group=self.dist_front_intra_bundle_group)
+            if len(self.front_intra_bundle_group) > 1:
+                for idx, grad in enumerate(self.front_ps):
+                    dist.broadcast(tensor=self.front_ps[idx],
+                                   src=self.front_intra_bundle_group[0],
+                                   group=self.dist_front_intra_bundle_group)
             dist_sync.toc()
 
             # distribute data to bundle
+            distribute_grad.tic()
             _sync_distribute_ps(num_worker=1,
                                 ps=self.front_ps,
                                 download_q=self.front_hp_downQ)
+            distribute_grad.toc()
 
             progress.print_progress(itr+1)
 
@@ -503,16 +542,22 @@ class HP_BUNDLE():
 
         # Average Meter
         dist_sync = AverageMeter('dist_sync', ':6.3f')
+        distribute_grad = AverageMeter('distribute_grad', ':6.3f')
         comm_forward = AverageMeter('comm_forward', ":6.3f")
+        comm_gather = AverageMeter('comm_gather', ":6.3f")
+        comm_scatter = AverageMeter('comm_scatter', ":6.3f")
         comm_backward = AverageMeter('comm_backward', ":6.3f")
         bundle_sync = AverageMeter('bundle_sync', ':6.3f')
         # Progress Meter
         progress = ProgressMeter(self.args.itr,
-                                 'HP_FRONT',
+                                 'HP_REAR',
                                  'white',
                                  dist_sync,
+                                 distribute_grad,
                                  comm_forward,
                                  comm_backward,
+                                 comm_gather,
+                                 comm_scatter,
                                  bundle_sync)
 
         # declare dist process
@@ -552,16 +597,17 @@ class HP_BUNDLE():
         input = torch.tensor(np.zeros([local_batch_size, 3, 224, 224], np.float32))
         front_output = front_model(input)
         rear_forward_input_tmp = torch.tensor(np.zeros(front_output.shape, np.float32))
+        bs = self.rear_worker_bs * self.local_shape[1]
 
         # initialization
-        if self.local_node_rank == self.rear_intra_bundle_group[0]:
+        if global_rank == self.rear_intra_bundle_group[0]:
             output_shape = [self.args.batch_size,
                             front_output.shape[1],
                             front_output.shape[2],
                             front_output.shape[3]]
             forward_tensor = torch.tensor(np.zeros(output_shape, np.float32))
             for rank in self.rear_intra_bundle_group:
-                bs = self.rear_worker_bs * self.topology[rank][1]
+                #bs = self.rear_worker_bs * self.topology[rank][1]
                 backprop_shape = [bs] + output_shape[1:]
                 backprop_mp_list.append(torch.tensor(np.zeros(backprop_shape, np.float32)))
 
@@ -569,23 +615,25 @@ class HP_BUNDLE():
 
             comm_forward.tic()
             # get feed forward from dist for mp
-            if self.local_node_rank == self.rear_intra_bundle_group[0]:
+            if global_rank == self.rear_intra_bundle_group[0]:
                 # Receive forward tensors from front representative
                 dist.recv(tensor=forward_tensor,
                           src=self.mp_intra_bundle_group[0],
                           group=self.dist_mp_intra_bundle_group)
 
-
                 rear_local_bs = self.rear_worker_bs * self.local_shape[1]
                 forward_mp_list = list(torch.split(forward_tensor, rear_local_bs))
+            comm_forward.toc()
 
             # distribute forward tensors to rear workers
-            dist.scatter(tensor=rear_forward_input_tmp,
-                         scatter_list=forward_mp_list,
-                         src=self.rear_intra_bundle_group[0],
-                         group=self.dist_rear_intra_bundle_group,
-                         async_op=False)
-            comm_forward.toc()
+            if len(self.rear_intra_bundle_group) > 1:
+                comm_scatter.tic()
+                dist.scatter(tensor=rear_forward_input_tmp,
+                             scatter_list=forward_mp_list,
+                             src=self.rear_intra_bundle_group[0],
+                             group=self.dist_rear_intra_bundle_group,
+                             async_op=False)
+                comm_scatter.toc()
 
 
             # send the forward tensor to Bundle
@@ -594,16 +642,19 @@ class HP_BUNDLE():
             # collect back propagation tensor for mp
             back_propagation_tmp = self.rear_hp_upQ[0].get()
 
-            comm_backward.tic()
             # intra collect (dist.gather)
-            dist.gather(tensor=back_propagation_tmp,
-                        gather_list=backprop_mp_list,
-                        dst=self.rear_intra_bundle_group[0],
-                        group=self.dist_rear_intra_bundle_group,
-                        async_op=False)
+            if len(self.rear_intra_bundle_group) > 1:
+                comm_gather.tic()
+                dist.gather(tensor=back_propagation_tmp,
+                            gather_list=backprop_mp_list,
+                            dst=self.rear_intra_bundle_group[0],
+                            group=self.dist_rear_intra_bundle_group,
+                            async_op=False)
+                comm_gather.toc()
 
+            comm_backward.tic()
             # send back propagation to front server
-            if self.local_node_rank == self.rear_intra_bundle_group[0]:
+            if global_rank == self.rear_intra_bundle_group[0]:
                 # create merged
                 merged_backprop = torch.cat(backprop_mp_list)
                 dist.send(tensor=merged_backprop,
@@ -623,25 +674,32 @@ class HP_BUNDLE():
 
             dist_sync.tic()
             # intra all reduce
-            for grad in self.rear_ps:
-                dist.all_reduce(grad, op=dist.ReduceOp.SUM, group=self.dist_rear_intra_bundle_group)
+            if len(self.rear_intra_bundle_group) > 1:
+                for grad in self.rear_ps:
+                    dist.reduce(grad,
+                                op=dist.ReduceOp.SUM,
+                                dst=self.rear_intra_bundle_group[0],
+                                group=self.dist_rear_intra_bundle_group)
 
             # inter all reduce
-            if self.local_node_rank == self.rear_intra_bundle_group[0]:
+            if (len(self.global_sync_rear_dp) > 1) and (self.local_node_rank == self.rear_intra_bundle_group[0]):
                 for grad in self.rear_ps:
                     dist.all_reduce(grad, op=dist.ReduceOp.SUM, group=self.sync_rear_group)
 
             # intra distribute sync
-            for idx, grad in enumerate(self.rear_ps):
-                dist.broadcast(tensor=self.rear_ps[idx],
-                               src=self.rear_intra_bundle_group[0],
-                               group=self.dist_rear_intra_bundle_group)
+            if len(self.rear_intra_bundle_group) > 1:
+                for idx, grad in enumerate(self.rear_ps):
+                    dist.broadcast(tensor=self.rear_ps[idx],
+                                   src=self.rear_intra_bundle_group[0],
+                                   group=self.dist_rear_intra_bundle_group)
             dist_sync.toc()
 
             # distribute data to bundle
+            distribute_grad.tic()
             _sync_distribute_ps(num_worker=1,
                                 ps=self.rear_ps,
                                 download_q=self.rear_hp_downQ)
+            distribute_grad.toc()
 
             progress.print_progress(itr+1)
 
@@ -653,13 +711,15 @@ class HP_BUNDLE():
 
         # Average Meter
         dist_sync = AverageMeter('dist_sync', ':6.3f')
+        distribute_grad = AverageMeter('distribute_grad', ':6.3f')
         comm_mp = AverageMeter('comm_mp', ":6.3f")
         # Progress Meter
         progress = ProgressMeter(self.args.itr,
-                                      'HP_FRONT',
-                                      'white',
-                                      dist_sync,
-                                      comm_mp)
+                                 'HP_FRONT',
+                                 'white',
+                                 dist_sync,
+                                 distribute_grad,
+                                 comm_mp)
 
         # declare dist process
         rank = self.args.rank * 2
@@ -690,16 +750,18 @@ class HP_BUNDLE():
                                  ps=self.front_ps,
                                  upload_q=self.front_hp_upQ)
 
-            for grad in self.front_ps:
-                dist.all_reduce(grad, op=dist.ReduceOp.SUM, group=self.sync_front_group)
-
             dist_sync.tic()
+            if len(self.global_sync_front_dp) > 1:
+                for grad in self.front_ps:
+                    dist.all_reduce(grad, op=dist.ReduceOp.SUM, group=self.sync_front_group)
+            dist_sync.toc()
+
             # distribute data to bundle p
+            distribute_grad.tic()
             _sync_distribute_ps(num_worker=self.local_num_hp,
                                 ps=self.front_ps,
                                 download_q=self.front_hp_downQ)
-            dist_sync.toc()
-
+            distribute_grad.toc()
             progress.print_progress(itr+1)
 
         # WAIT
@@ -710,12 +772,14 @@ class HP_BUNDLE():
 
         # Average Meter
         dist_sync = AverageMeter('dist_sync', ':6.3f')
+        distribute_grad = AverageMeter('distribute_grad', ':6.3f')
         comm_mp = AverageMeter('comm_mp', ":6.3f")
         # Progress Meter
         progress = ProgressMeter(self.args.itr,
                                  'HP_REAR',
                                  'white',
                                  dist_sync,
+                                 distribute_grad,
                                  comm_mp)
 
         # declare dist process
@@ -748,14 +812,17 @@ class HP_BUNDLE():
                                  upload_q=self.rear_hp_upQ)
 
             dist_sync.tic()
-            for grad in self.rear_ps:
-                dist.all_reduce(grad, op=dist.ReduceOp.SUM, group=self.sync_rear_group)
+            if len(self.global_sync_rear_dp) > 1:
+                for grad in self.rear_ps:
+                    dist.all_reduce(grad, op=dist.ReduceOp.SUM, group=self.sync_rear_group)
             dist_sync.toc()
 
             # distribute data to bundle p
+            distribute_grad.tic()
             _sync_distribute_ps(num_worker=self.local_num_hp,
                                 ps=self.rear_ps,
                                 download_q=self.rear_hp_downQ)
+            distribute_grad.toc()
 
             progress.print_progress(itr+1)
 
@@ -1346,6 +1413,14 @@ class DPBundle():
 
     def _ps(self):
 
+        # Average Meter
+        dist_sync = AverageMeter('dist_sync', ':6.3f')
+       # Progress Meter
+        progress = ProgressMeter(self.args.itr,
+                                 'ParameterServer',
+                                 'yellow',
+                                 dist_sync)
+
         dist.init_process_group(backend='gloo',
                                 init_method='tcp://%s:%s' % (self.args.IP, self.args.portNum),
                                 rank=self.rank,
@@ -1363,14 +1438,18 @@ class DPBundle():
                                  ps=self.ps,
                                  upload_q=self.ps_upQ)
 
+            dist_sync.tic()
             # all reduce
             for grad in self.ps:
                 dist.all_reduce(grad, op=dist.ReduceOp.SUM)
+            dist_sync.toc()
 
             # distribute gradients
             _sync_distribute_ps(num_worker=self.num_worker,
                                 ps=self.ps,
                                 download_q=self.ps_downQ)
+
+            progress.print_progress(itr+1)
 
         # WAIT
         time.sleep(1)

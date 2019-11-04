@@ -25,9 +25,11 @@ class Worker():
         self.sync_download = AverageMeter('sync_download', ':6.3f')
         self.comp_forward = AverageMeter('comp_forward', ':6.3f')
         self.comp_backprop = AverageMeter('comp_backprop', ':6.3f')
+        self.itr = AverageMeter('itr', ':6.3f')
         self.progress = ProgressMeter(self.args.itr,
                                       'worker_rank %d'%self.local_rank,
                                       'white',
+                                      self.itr,
                                       self.sync_upload,
                                       self.sync_download,
                                       self.comp_forward,
@@ -62,6 +64,8 @@ class Worker():
             data = data.cuda(self.gpu_rank)
             target = target.cuda(self.gpu_rank)
 
+            self.itr.tic()
+
             # feed forward
             self.comp_forward.tic()
             output = self.net(data)
@@ -80,9 +84,11 @@ class Worker():
 
             # synchronize all gradients
             self._synchronization()
+            self.itr.toc()
 
             # apply the update
             optimizer.step()
+
             del data, target, loss
             torch.cuda.empty_cache()
             self.progress.print_progress(batch_idx+1)
@@ -95,9 +101,7 @@ class Worker():
         self.sync_upload.tic()
         self._sync_upload()
         self.sync_upload.toc()
-        self.sync_download.tic()
         self._sync_download()
-        self.sync_download.toc()
 
     def _sync_upload(self):
 
@@ -108,10 +112,15 @@ class Worker():
 
     def _sync_download(self):
 
+        t_download = 0
         for layer in self.net.parameters():
             tmp = self.down_Q.get()
+            stamp = time.time()
             layer.grad.data.copy_(tmp)
+            torch.cuda.synchronize()
+            t_download += time.time() - stamp
             del tmp
+        self.sync_download.update(t_download)
 
     def _prepare_training(self):
 
@@ -174,6 +183,7 @@ class Front(Worker):
         self.progress = ProgressMeter(self.args.itr,
                                       'FRONT %d'%self.local_rank,
                                       'yellow',
+                                      self.itr,
                                       self.collective,
                                       self.distribute,
                                       self.sync_upload,
@@ -200,28 +210,29 @@ class Front(Worker):
             data = data.cuda(self.gpu_rank)
             optimizer.zero_grad()
 
+            self.itr.tic()
+
             # feed forward
             self.comp_forward.tic()
             output = self.net(data)
+            torch.cuda.synchronize()
             self.comp_forward.toc()
 
             # upload feed forward output to ps (to send rear worker the outcome)
-            self.collective.tic()
             self._upload_feedforward(output)
-            self.collective.toc()
 
             # download backprop input from ps
-            self.distribute.tic()
             self._download_backprop()
-            self.distribute.toc()
 
             # backpropagation
             self.comp_backprop.tic()
             output.backward(self.backprop_input)
+            torch.cuda.synchronize()
             self.comp_backprop.toc()
 
             # synchronization
             self._synchronization()
+            self.itr.toc()
 
             # update
             optimizer.step()
@@ -233,12 +244,18 @@ class Front(Worker):
                 return
 
     def _upload_feedforward(self, output):
+        self.collective.tic()
         gpu_to_cpu = output.cpu().detach()
+        torch.cuda.synchronize()
+        self.collective.toc()
         self._upload_to_ps(gpu_to_cpu)
 
     def _download_backprop(self):
         cpu_to_gpu = self._download_from_ps()
+        self.distribute.tic()
         self.backprop_input = cpu_to_gpu.cuda(self.gpu_rank)
+        torch.cuda.synchronize()
+        self.distribute.toc()
 
 
 class Rear(Worker):
@@ -254,6 +271,7 @@ class Rear(Worker):
         self.progress = ProgressMeter(self.args.itr,
                                       'REAR  %d'%self.local_rank,
                                       'green',
+                                      self.itr,
                                       self.collective,
                                       self.distribute,
                                       self.sync_upload,
@@ -286,10 +304,10 @@ class Rear(Worker):
             optimizer.zero_grad()
             target = target.cuda(self.gpu_rank)
 
+            self.itr.tic()
+
             # Receive feed forward input from ps
-            self.distribute.tic()
             self._download_feedforward()
-            self.distribute.toc()
 
             # feed forward
             self.comp_forward.tic()
@@ -302,15 +320,15 @@ class Rear(Worker):
             # backpropagation
             self.comp_backprop.tic()
             loss.backward()
+            torch.cuda.synchronize()
             self.comp_backprop.toc()
 
             # upload backpropagation result
-            self.collective.tic()
             self._upload_backprop()
-            self.collective.toc()
 
             # synchronization
             self._synchronization()
+            self.itr.toc()
 
             # update
             optimizer.step()
@@ -327,10 +345,15 @@ class Rear(Worker):
     def _download_feedforward(self):
 
         tmp = self._download_from_ps()
+        self.distribute.tic()
         tmp = tmp.cuda(self.gpu_rank)
         self.forward_input = Variable(tmp, requires_grad=True).cuda(self.gpu_rank)
+        self.distribute.toc()
         del tmp
 
     def _upload_backprop(self):
-
-        self._upload_to_ps(self.forward_input.grad.data.cpu().detach())
+        self.collective.tic()
+        data = self.forward_input.grad.data.cpu().detach()
+        torch.cuda.synchronize()
+        self.collective.toc()
+        self._upload_to_ps(data)
