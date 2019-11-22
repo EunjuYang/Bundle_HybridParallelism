@@ -75,7 +75,6 @@ def _sync_distribute_ps(num_worker, ps, download_q):
         t.join()
     return
 
-
 def _get_bundle_topology(shape):
     """
     :param shape: list describing bundle shape [#fronts, #rear]
@@ -273,14 +272,14 @@ class HP_BUNDLE():
         if self.IS_MICRO_BUNDLE:
             self.local_num_hp = 1
         else:
-            local_max_num_hp = self.num_gpus // (self.topology[0][0] + self.topology[0][1])
-            if self.args.num_bundle > local_max_num_hp * self.args.world_size:
+            self.local_max_num_hp = self.num_gpus // (self.topology[0][0] + self.topology[0][1])
+            if self.args.num_bundle > self.local_max_num_hp * self.args.world_size:
                 _print_error("Please check the running configuration ! \n"
                              "\tIn sufficient number of workers", True)
 
-            num_hp = [local_max_num_hp] * self.args.world_size
-            if self.args.num_bundle % local_max_num_hp is not 0:
-                num_hp[self.args.num_bundle // local_max_num_hp] = self.args.num_bundle % local_max_num_hp
+            num_hp = [self.local_max_num_hp] * self.args.world_size
+            if self.args.num_bundle % self.local_max_num_hp is not 0:
+                num_hp[self.args.num_bundle // self.local_max_num_hp] = self.args.num_bundle % self.local_max_num_hp
             self.local_num_hp = num_hp[self.node_rank]
 
         if self.IS_MICRO_BUNDLE:
@@ -296,6 +295,7 @@ class HP_BUNDLE():
 
         self.local_node_rank = self.node_rank % self.bundle_degree
         self.bundle_rank = self.node_rank // self.bundle_degree
+        self.batch_size = self.args.batch_size // self.num_bundles
 
         if self.IS_MICRO_BUNDLE and self.bundle_degree * self.num_bundles > self.num_nodes:
             _print_error("This INTER_BUNDLE cannot run on this configuration \n" +
@@ -338,7 +338,8 @@ class HP_BUNDLE():
 
     def _get_monolithic_bundle_rank(self):
 
-        if self.local_num_hp * self.num_nodes < self.num_bundles:
+
+        if self.local_max_num_hp * self.num_nodes < self.num_bundles:
             _print_error("Number of node is not sufficient to run this bundle", True)
         elif self.node_rank > self.num_bundles // self.local_num_hp:
             print(colored("<WARNING>", "yellow"),
@@ -346,7 +347,7 @@ class HP_BUNDLE():
             exit()
 
         else:
-            self.world_num_nodes = math.ceil(self.num_bundles / self.local_num_hp)
+            self.world_num_nodes = math.ceil(self.num_bundles / self.local_max_num_hp)
             self.world_size = self.world_num_nodes * 2
             self.batch_size = self.args.batch_size // self.num_bundles
             self.global_sync_front_dp = [2 * i for i in range(self.world_num_nodes)]
@@ -442,39 +443,41 @@ class HP_BUNDLE():
                 comm_gather.toc()
 
             # send feed forward to rear server
-            comm_forward.tic()
             if self.local_node_rank == self.front_intra_bundle_group[0]:
                 # create merged feed forward tensor
                 merged_forward = torch.cat(forward_mp_list)
                 merged_forward = (merged_forward.split(self.args.batch_size))[0]
                 # send feed forward tensor
+                comm_forward.tic()
                 dist.send(tensor=merged_forward,
                           dst=self.mp_intra_bundle_group[1],
                           group=self.dist_mp_intra_bundle_group)
-            comm_forward.toc()
+                comm_forward.toc()
 
-            comm_backward.tic()
             # distribute backprop for mp
             if self.local_node_rank == self.front_intra_bundle_group[0]:
                 # merged backpropagation tensor
                 merged_backprop = torch.tensor(np.zeros(merged_forward.shape, np.float32))
                 # receive from the representative rear server
+                comm_backward.tic()
                 dist.recv(tensor=merged_backprop,
                           src=self.mp_intra_bundle_group[1],
                           group=self.dist_mp_intra_bundle_group)
 
+                comm_backward.toc()
                 # split the backpropagation tensor into tensors list
                 backprop_mp_list = list(torch.split(merged_backprop,
                                                     front_bs))
-            comm_backward.toc()
 
             # scatter the split backpropagation within intra-bundle
             if len(self.front_intra_bundle_group) > 1:
                 # check padding for scatter
                 for front_rank in range(len(backprop_mp_list)):
                     worker_bs = backprop_mp_list[front_rank].shape[0]
+
+                    # add dummy data!
                     if worker_bs < front_bs:
-                        backprop_mp_list[front_rank] = torch.cat([backprop_mp_list[front_rank], backprop_mp_list[front_rank][:(front_bs-worker_bs)]])
+                        backprop_mp_list[front_rank] = torch.cat([backprop_mp_list[front_rank], backprop_mp_list[front_rank-1][:(front_bs-worker_bs)]])
 
                 comm_scatter.tic()
                 dist.scatter(tensor=backprop_tmp,
@@ -613,17 +616,17 @@ class HP_BUNDLE():
 
         for itr in range(self.args.itr):
 
-            comm_forward.tic()
             # get feed forward from dist for mp
             if global_rank == self.rear_intra_bundle_group[0]:
                 # Receive forward tensors from front representative
+                comm_forward.tic()
                 dist.recv(tensor=forward_tensor,
                           src=self.mp_intra_bundle_group[0],
                           group=self.dist_mp_intra_bundle_group)
+                comm_forward.toc()
 
                 rear_local_bs = self.rear_worker_bs * self.local_shape[1]
                 forward_mp_list = list(torch.split(forward_tensor, rear_local_bs))
-            comm_forward.toc()
 
             # distribute forward tensors to rear workers
             if len(self.rear_intra_bundle_group) > 1:
@@ -652,15 +655,16 @@ class HP_BUNDLE():
                             async_op=False)
                 comm_gather.toc()
 
-            comm_backward.tic()
             # send back propagation to front server
             if global_rank == self.rear_intra_bundle_group[0]:
                 # create merged
                 merged_backprop = torch.cat(backprop_mp_list)
+                merged_backprop = (merged_backprop.split(self.args.batch_size))[0]
+                comm_backward.tic()
                 dist.send(tensor=merged_backprop,
                           dst=self.mp_intra_bundle_group[0],
                           group=self.dist_mp_intra_bundle_group)
-            comm_backward.toc()
+                comm_backward.toc()
 
             # collect gradient data for sync
             if itr == 0:
@@ -810,6 +814,7 @@ class HP_BUNDLE():
                 _sync_collect_ps(num_worker=self.local_num_hp,
                                  ps=self.rear_ps,
                                  upload_q=self.rear_hp_upQ)
+
 
             dist_sync.tic()
             if len(self.global_sync_rear_dp) > 1:
@@ -1371,7 +1376,16 @@ class DPBundle():
         self.workers = []
         self.rank = rank
         self.args = args
-        self.num_worker = args.num_bundle // args.world_size
+        num_gpus = torch.cuda.device_count()
+        num_workers = []
+        for i in range(args.world_size):
+            total_workers = sum(num_workers)
+            if args.num_bundle - total_workers >= num_gpus:
+                num_workers.append(num_gpus)
+            else:
+                num_workers.append(args.num_bundle - total_workers)
+
+        self.num_worker = num_workers[rank]
         self.batch_size = args.batch_size // args.num_bundle
         self.ps_upQ = []
         self.ps_downQ = []
