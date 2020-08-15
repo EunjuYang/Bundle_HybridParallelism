@@ -1,10 +1,10 @@
-# Bundle-based Hybrid Parallelism Example
+# Hybrid Parallelism Example
 
 This repository contains example code for Bundle-based Hybrid Parallelism.
 How to split the model should be defined under `model.py` with its model name.
 
 ----
-### Bundle-based Hybrid Parallelism
+### Hybrid Parallelism
 
 
 ![Example of Hybrid Parallelism](Figure/Bundle_HP_Figure.png)
@@ -21,7 +21,7 @@ For more detail, please refer to paper.
 ### How to execute
 
 This code supports ...  
- - Bundle-based hybrid parallelism 
+ - Hybrid parallelism 
  - Data parallelism
  - Model parallelism
  
